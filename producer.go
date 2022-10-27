@@ -242,7 +242,10 @@ func (p *Producer) flush(records []*kinesis.PutRecordsRequestEntry, reason strin
 	defer p.semaphore.release()
 
 	for {
-		//p.Logger.Info("flushing records", LogValue{"reason", reason}, LogValue{"records", len(records)})
+		if p.Verbose {
+			p.Logger.Info("flushing records", LogValue{"reason", reason}, LogValue{"records", len(records)})
+		}
+
 		out, err := p.Client.PutRecords(&kinesis.PutRecordsInput{
 			StreamName: &p.StreamName,
 			Records:    records,
