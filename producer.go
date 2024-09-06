@@ -24,8 +24,22 @@ var (
 	ErrRecordSizeExceeded  = errors.New("Data must be less than or equal to 1MB in size")
 )
 
-// Producer batches records.
-type Producer struct {
+type Producer interface {
+	Put(data []byte, partitionKey string) error
+	NotifyFailures() <-chan *FailureRecord
+	Start()
+	Stop()
+
+	SetLogger(Logger)
+	SetBatchCount(int)
+	SetBatchSize(int)
+	SetFlushInterval(time.Duration)
+}
+
+var _ Producer = (*Instance)(nil)
+
+// Instance batches records.
+type Instance struct {
 	sync.RWMutex
 	*Config
 	aggregator *Aggregator
@@ -43,9 +57,9 @@ type Producer struct {
 }
 
 // New creates new producer with the given config.
-func New(config *Config) *Producer {
+func New(config *Config) *Instance {
 	config.defaults()
-	return &Producer{
+	return &Instance{
 		Config:     config,
 		done:       make(chan struct{}),
 		records:    make(chan *kinesis.PutRecordsRequestEntry, config.BacklogCount),
@@ -61,7 +75,7 @@ func New(config *Config) *Producer {
 // When unrecoverable error has detected(e.g: trying to put to in a stream that
 // doesn't exist), the message will returned by the Producer.
 // Add a listener with `Producer.NotifyFailures` to handle undeliverable messages.
-func (p *Producer) Put(data []byte, partitionKey string) error {
+func (p *Instance) Put(data []byte, partitionKey string) error {
 	p.RLock()
 	stopped := p.stopped
 	p.RUnlock()
@@ -116,7 +130,7 @@ type FailureRecord struct {
 // NotifyFailures registers and return listener to handle undeliverable messages.
 // The incoming struct has a copy of the Data and the PartitionKey along with some
 // error information about why the publishing failed.
-func (p *Producer) NotifyFailures() <-chan *FailureRecord {
+func (p *Instance) NotifyFailures() <-chan *FailureRecord {
 	p.Lock()
 	defer p.Unlock()
 	if !p.notify {
@@ -127,13 +141,13 @@ func (p *Producer) NotifyFailures() <-chan *FailureRecord {
 }
 
 // Start the producer
-func (p *Producer) Start() {
+func (p *Instance) Start() {
 	p.Logger.Info("starting producer", LogValue{"stream", p.StreamName})
 	go p.loop()
 }
 
 // Stop the producer gracefully. Flushes any in-flight data.
-func (p *Producer) Stop() {
+func (p *Instance) Stop() {
 	p.Lock()
 	p.stopped = true
 	p.Unlock()
@@ -159,8 +173,24 @@ func (p *Producer) Stop() {
 	p.Logger.Info("stopped producer")
 }
 
+func (p *Instance) SetLogger(l Logger) {
+	p.Logger = l
+}
+
+func (p *Instance) SetBatchCount(c int) {
+	p.BatchCount = c
+}
+
+func (p *Instance) SetBatchSize(s int) {
+	p.BatchSize = s
+}
+
+func (p *Instance) SetFlushInterval(t time.Duration) {
+	p.FlushInterval = t
+}
+
 // loop and flush at the configured interval, or when the buffer is exceeded.
-func (p *Producer) loop() {
+func (p *Instance) loop() {
 	size := 0
 	drain := false
 	buf := make([]*kinesis.PutRecordsRequestEntry, 0, p.BatchCount)
@@ -215,7 +245,7 @@ func (p *Producer) loop() {
 	}
 }
 
-func (p *Producer) drainIfNeed() (*kinesis.PutRecordsRequestEntry, bool) {
+func (p *Instance) drainIfNeed() (*kinesis.PutRecordsRequestEntry, bool) {
 	p.RLock()
 	needToDrain := p.aggregator.Size() > 0
 	p.RUnlock()
@@ -234,7 +264,7 @@ func (p *Producer) drainIfNeed() (*kinesis.PutRecordsRequestEntry, bool) {
 
 // flush records and retry failures if necessary.
 // for example: when we get "ProvisionedThroughputExceededException"
-func (p *Producer) flush(records []*kinesis.PutRecordsRequestEntry, reason string) {
+func (p *Instance) flush(records []*kinesis.PutRecordsRequestEntry, reason string) {
 	b := &backoff.Backoff{
 		Jitter: true,
 	}
@@ -298,7 +328,7 @@ func (p *Producer) flush(records []*kinesis.PutRecordsRequestEntry, reason strin
 
 // dispatchFailures gets batch of records, extract them, and push them
 // into the failure channel
-func (p *Producer) dispatchFailures(records []*kinesis.PutRecordsRequestEntry, err error) {
+func (p *Instance) dispatchFailures(records []*kinesis.PutRecordsRequestEntry, err error) {
 	for _, r := range records {
 		if isAggregated(r) {
 			p.dispatchFailures(extractRecords(r), err)
